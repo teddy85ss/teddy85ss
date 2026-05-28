@@ -1,35 +1,22 @@
-name: VIP Dedicated Download
+name: Download and Split for User
 
 on:
   workflow_dispatch:
     inputs:
-      user_id:
-        description: 'شناسه کاربر تلگرام'
-        required: true
-        type: string
-      zip_password:
-        description: 'رمز فایل فشرده'
-        required: true
-        type: string
-      worker_url:
-        description: 'آدرس Worker ربات VIP'
-        required: false
-        default: 'https://vip.shoposhal.workers.dev'
-        type: string
       file_url:
-        description: 'لینک مستقیم فایل (خالی = یوتیوب یا تلگرام)'
+        description: 'لینک مستقیم فایل (در صورت وجود)'
         required: false
         type: string
       file_id:
-        description: 'شناسه فایل تلگرام (خالی = لینک)'
+        description: 'شناسه فایل تلگرام (در صورت آپلود مستقیم)'
         required: false
         type: string
       media_url:
-        description: 'لینک یوتیوب (خالی = دانلود فایل)'
+        description: 'لینک یوتیوب (برای دانلود ویدیو)'
         required: false
         type: string
       desired_quality:
-        description: 'کیفیت مورد نظر (فقط یوتیوب)'
+        description: 'کیفیت مورد نظر یوتیوب'
         required: false
         default: '720'
         type: choice
@@ -39,7 +26,7 @@ on:
           - '480'
           - '360'
       min_quality:
-        description: 'حداقل کیفیت (فقط یوتیوب)'
+        description: 'حداقل کیفیت یوتیوب'
         required: false
         default: '360'
         type: choice
@@ -51,9 +38,24 @@ on:
       max_size_mb:
         description: 'حداکثر حجم مگابایت'
         required: false
-        default: '10240'
+        default: '4096'
         type: string
-
+      zip_password:
+        description: 'رمز عبور ZIP'
+        required: true
+        type: string
+      user_id:
+        description: 'شناسه کاربر'
+        required: true
+        type: string
+      chat_id:
+        description: 'شناسه چت تلگرام (برای re-fetch فایل)'
+        required: false
+        type: string
+      message_id:
+        description: 'شناسه پیام تلگرام (برای re-fetch فایل)'
+        required: false
+        type: string
 permissions:
   contents: write
 
@@ -62,21 +64,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-
-      - name: Notify Worker Started
+      - name: Notify Worker that job started
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/started" \
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/started" \
             -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\"}" || true
 
-      - name: Checkout Repository
+      - name: Optimized Checkout (fast)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Install Dependencies
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y p7zip-full wget
+          sudo apt-get update -qq && sudo apt-get install -y p7zip-full wget zip
           pip install pyrogram tgcrypto --quiet --break-system-packages || pip install pyrogram tgcrypto --quiet
 
       - name: Setup yt-dlp
@@ -88,7 +89,12 @@ jobs:
         env:
           COOKIE_BASE64: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
-          if [ -n "$COOKIE_BASE64" ]; then echo "$COOKIE_BASE64" | base64 -d > cookies.txt; fi
+          if [ -n "$COOKIE_BASE64" ]; then
+            echo "$COOKIE_BASE64" | base64 -d > cookies.txt
+            echo "YouTube cookies loaded."
+          else
+            echo "No YOUTUBE_COOKIES secret found, continuing without cookies."
+          fi
         shell: bash
 
       - name: Select YouTube Quality
@@ -99,15 +105,19 @@ jobs:
           DESIRED_Q: ${{ github.event.inputs.desired_quality }}
           MIN_Q: ${{ github.event.inputs.min_quality }}
         run: |
-          COOKIE_ARG=""; [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
-          MAX_BYTES=$((${MAX_SIZE_MB:-4096} * 1024 * 1024))
+          COOKIE_ARG=""
+          [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
+          MAX_BYTES=$(( ${MAX_SIZE_MB:-4096} * 1024 * 1024 ))
           SELECTED=""
           for q in 1080 720 480 360 240 144; do
             if [ $q -le ${DESIRED_Q:-720} ] && [ $q -ge ${MIN_Q:-360} ]; then
               SIZE_INFO=$(yt-dlp $COOKIE_ARG --format "bestvideo[height<=${q}]+bestaudio/best[height<=${q}]" --print "%(filesize,filesize_approx)s" "$YT_URL" 2>/dev/null || echo "0")
               FILE_SIZE=$(echo "$SIZE_INFO" | head -1 | tr -d '[:space:]')
               [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" = "NA" ] || [ "$FILE_SIZE" = "None" ] && FILE_SIZE=0
-              if [ "$FILE_SIZE" -eq 0 ] || [ "$FILE_SIZE" -le "$MAX_BYTES" ]; then SELECTED=$q; break; fi
+              if [ "$FILE_SIZE" -eq 0 ] 2>/dev/null || [ "$FILE_SIZE" -le "$MAX_BYTES" ] 2>/dev/null; then
+                SELECTED=$q
+                break
+              fi
             fi
           done
           [ -z "$SELECTED" ] && SELECTED=${MIN_Q:-360}
@@ -120,20 +130,22 @@ jobs:
           YT_URL: ${{ github.event.inputs.media_url }}
           SELECTED_QUALITY: ${{ env.selected_quality }}
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
-          COOKIE_ARG=""; [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
+          COOKIE_ARG=""
+          [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
           yt-dlp $COOKIE_ARG \
             --format "bestvideo[height<=${SELECTED_QUALITY}]+bestaudio/best[height<=${SELECTED_QUALITY}]" \
             --merge-output-format mp4 --output "video.%(ext)s" --no-playlist \
             --retries 5 --fragment-retries 5 --retry-sleep 5 "$YT_URL"
           VIDEO_FILE=$(ls video.* 2>/dev/null | head -1)
-          [ -z "$VIDEO_FILE" ] && { echo "File not found!"; exit 1; }
+          [ -z "$VIDEO_FILE" ] && { echo "Video file not found!"; exit 1; }
           FILE_SIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || echo "0")
-          echo "DOWNLOAD_FILE=$VIDEO_FILE" >> $GITHUB_ENV
+          echo "ORIGINAL_NAME=$VIDEO_FILE" >> $GITHUB_ENV
           echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
         shell: bash
 
-      - name: Download File (Link or Telegram)
+      - name: Download file (Link OR Telegram File ID)
         if: ${{ github.event.inputs.media_url == '' }}
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -141,90 +153,100 @@ jobs:
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
+          INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          INPUT_MESSAGE_ID: ${{ github.event.inputs.message_id }}
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
           if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ] && [ "$INPUT_FILE_URL" != "" ]; then
+            echo "Using HTTP Link download..."
             ORIGINAL_NAME=$(basename "$INPUT_FILE_URL" | cut -d '?' -f1)
             [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            cat > dl_script.py << 'PYEOF'
-import os, asyncio
-from pyrogram import Client
-from pyrogram.types import Message
+            echo "Using Direct Telegram Download via MTProto..."
+            cat << 'PYEOF' > dl_script.py
+          import os, asyncio
+          from pyrogram import Client
 
-async def main():
-    api_id = int(os.environ['TG_API_ID'])
-    api_hash = os.environ['TG_API_HASH']
-    session_string = os.environ['TG_SESSION_STRING']
-    file_id = os.environ['INPUT_FILE_ID']
+          async def main():
+              api_id = int(os.environ['TG_API_ID'])
+              api_hash = os.environ['TG_API_HASH']
+              session_string = os.environ['TG_SESSION_STRING']
+              file_id = os.environ['INPUT_FILE_ID']
+              chat_id = os.environ.get('INPUT_CHAT_ID', '').strip()
+              message_id = os.environ.get('INPUT_MESSAGE_ID', '').strip()
+              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+              async with app:
+                  print("Connected to Telegram via Session String! Downloading file...")
+                  if chat_id and message_id and chat_id != "null" and message_id != "null":
+                      msg = await app.get_messages(int(chat_id), int(message_id))
+                      file_path = await app.download_media(msg)
+                  else:
+                      file_path = await app.download_media(file_id)
+                  if file_path:
+                      print(f"Downloaded successfully to: {file_path}")
+                      open("filename.txt", "w").write(file_path)
+                  else:
+                      print("Download failed via Pyrogram!")
+                      exit(1)
 
-    app = Client("session", session_string=session_string,
-                 api_id=api_id, api_hash=api_hash)
-    async with app:
-        # دانلود مستقیم با file_id — Pyrogram خودش file_reference را مدیریت می‌کند
-        try:
-            path = await app.download_media(file_id, file_name="downloaded_file")
-        except Exception as e:
-            print(f"download_media error: {e}")
-            # تلاش دوم با get_messages اگر chat_id در file_id باشد
-            raise
-        if path:
-            open("filename.txt", "w").write(path)
-        else:
-            raise Exception("download_media returned None")
-
-asyncio.run(main())
-PYEOF
+          asyncio.run(main())
+          PYEOF
             python dl_script.py
-            ORIGINAL_NAME=$(cat filename.txt 2>/dev/null || echo "")
+            ORIGINAL_NAME=$(cat filename.txt)
           else
-            echo "No file_url or file_id!"; exit 1
+            echo "No file_url or file_id provided!"
+            exit 1
           fi
-          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Empty file!"; exit 1; }
+          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty or missing!"; exit 1; }
           FILE_SIZE=$(stat -c%s "$ORIGINAL_NAME" 2>/dev/null || echo "0")
-          echo "DOWNLOAD_FILE=$ORIGINAL_NAME" >> $GITHUB_ENV
+          echo "ORIGINAL_NAME=$ORIGINAL_NAME" >> $GITHUB_ENV
           echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-        shell: bash
+          echo "Download completed successfully"
 
-      - name: Notify Worker Compress
+      - name: Create archive chunks (95MB each)
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
+          
+          # قدم ۱: ساخت فایل زیپ بدون فشردگی و با رمز ساده
+          zip -0 -P "${{ github.event.inputs.zip_password }}" "archive_full.zip" "${{ env.ORIGINAL_NAME }}"
+          
+          # قدم ۲: تکه‌تکه کردن فایل با فرمت archive.zip.001, archive.zip.002
+          split -b 95M -d --numeric-suffixes=1 -a 3 "archive_full.zip" "archive.zip."
+          
+          # قدم ۳: پاک کردن فایل‌های اولیه برای آزادسازی فضا
+          rm -f "archive_full.zip"
+          rm -f "${{ env.ORIGINAL_NAME }}"
 
-      - name: Compress with Password
-        run: |
-          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=1 -v95m "archive.7z" "${{ env.DOWNLOAD_FILE }}"
-          rm -f "${{ env.DOWNLOAD_FILE }}"
-
-      - name: Configure Git
+      - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Get Chunks Count
+      - name: Get total chunks count
         id: chunks
         run: |
-          CHUNKS=$(ls archive.7z.* 2>/dev/null | wc -l)
+          CHUNKS=$(ls archive.zip.* 2>/dev/null | wc -l)
           [ "$CHUNKS" -eq 0 ] && CHUNKS=1
-          echo "total=$CHUNKS" >> $GITHUB_OUTPUT
+          echo "total_chunks=$CHUNKS" >> $GITHUB_OUTPUT
 
-      - name: Upload Chunks to Branch
-        id: upload
+      - name: Create user branch and upload chunks
         run: |
           FILE_TYPE="file"
           [ -n "${{ github.event.inputs.media_url }}" ] && FILE_TYPE="yt"
-          BRANCH_NAME="vip_${FILE_TYPE}_${{ github.event.inputs.user_id }}_$(date +%s)"
+          BRANCH_NAME="user_${{ github.event.inputs.user_id }}_$(date +%s)"
 
           git checkout --orphan "$BRANCH_NAME"
           git rm -rf . 2>/dev/null || true
-          echo "# VIP ${{ github.event.inputs.user_id }}" > README.md
+          echo "# Files for user ${{ github.event.inputs.user_id }}" > README.md
 
-          chunks=(archive.7z.*)
+          chunks=(archive.zip.*)
           total=${#chunks[@]}
-          [ $total -eq 0 ] && { chunks=(archive.7z); total=1; }
+          [ $total -eq 0 ] && { chunks=(archive.zip.001); total=1; }
 
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
-            -H "Content-Type: application/json" \
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"upload\",\"percent\":70,\"total_chunks\":$total}" || true
 
           batch_size=2; start=0; uploaded=0
@@ -233,28 +255,30 @@ PYEOF
             [ $end -ge $total ] && end=$((total - 1))
             for i in $(seq $start $end); do git add "${chunks[$i]}" 2>/dev/null || true; done
             git add README.md
-            git commit -m "vip $((start+1))-$((end+1))/$total"
-            for attempt in {1..5}; do git push origin "$BRANCH_NAME" && break; sleep 10; done
+            git commit -m "Add chunks $((start+1))-$((end+1)) of $total"
+            for attempt in {1..5}; do
+              git push origin "$BRANCH_NAME" && break
+              sleep 10
+            done
             uploaded=$((end+1))
             PERCENT=$((70 + uploaded * 28 / total))
-            curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
-              -H "Content-Type: application/json" \
+            curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
               -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"upload\",\"percent\":$PERCENT,\"uploaded_chunks\":$uploaded}" || true
             start=$((end + 1)); sleep 2
           done
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
         shell: bash
 
-      - name: Notify Worker Complete
+      - name: Notify Worker that job is done
         if: success()
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/complete" \
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/complete" \
             -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"${{ env.BRANCH_NAME }}\",\"file_size\":${{ env.DOWNLOAD_SIZE }}}"
 
-      - name: Notify Worker Failed
+      - name: Notify Worker on failure
         if: failure()
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/failed" \
+          curl -s -X POST "${{ secrets.WORKER_URL }}/api/failed" \
             -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"error\":\"Workflow failed\"}"
