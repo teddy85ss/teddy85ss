@@ -1,0 +1,42 @@
+name: Generate Bot Session String
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-session:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Pyrogram
+        run: pip install pyrogram tgcrypto
+
+      - name: Generate and print session string
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}   # 👈 مطمئن شو اسم سکرت توکن بات دقیقاً BOT_TOKEN باشه
+        run: |
+          python3 << 'EOF'
+          import asyncio, os
+          from pyrogram import Client
+
+          async def main():
+              bot = Client(
+                  "session_gen_bot",
+                  api_id=int(os.getenv("TG_API_ID")),
+                  api_hash=os.getenv("TG_API_HASH"),
+                  bot_token=os.getenv("BOT_TOKEN")
+              )
+              async with bot:
+                  session_str = await bot.export_session_string()
+                  print("\n✅ Session String generated successfully:\n")
+                  print(session_str)
+                  print("\n📌 Copy the above string and set it as TG_SESSION_STRING secret.")
+
+          asyncio.run(main())
+          EOF
